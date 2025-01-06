@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,9 +42,10 @@ var (
 )
 
 const (
-	privateKeyKey     = "privateKey"
-	gceAuthentication = "gce"
-	jwtAuthentication = "jwt"
+	privateKeyKey                  = "privateKey"
+	gceAuthentication              = "gce"
+	jwtAuthentication              = "jwt"
+	oauthpassthroughAuthentication = "oauthPassthrough"
 )
 
 // config is the fields parsed from the front end
@@ -54,6 +56,7 @@ type config struct {
 	TokenURI                    string `json:"tokenUri"`
 	ServiceAccountToImpersonate string `json:"serviceAccountToImpersonate"`
 	UsingImpersonation          bool   `json:"usingImpersonation"`
+	OauthPassthrough            bool   `json:"oauthPassthrough"`
 }
 
 // toServiceAccountJSON creates the serviceAccountJSON bytes from the config fields
@@ -91,7 +94,11 @@ func NewCloudLoggingDatasource(settings backend.DataSourceInstanceSettings) (ins
 	var client_err error
 	var client *cloudlogging.Client
 
-	if conf.AuthType == jwtAuthentication {
+	log.DefaultLogger.Info("oauthPassthrough: " + strconv.FormatBool(conf.OauthPassthrough))
+	if conf.OauthPassthrough {
+		client, client_err = cloudlogging.NewClientWithPassthrough(context.TODO())
+	} else if conf.AuthType == jwtAuthentication {
+		// TODO: Add support for extracting token from Grafana to pass on
 		privateKey, ok := settings.DecryptedSecureJSONData[privateKeyKey]
 		if !ok || privateKey == "" {
 			return nil, errMissingCredentials
@@ -119,14 +126,16 @@ func NewCloudLoggingDatasource(settings backend.DataSourceInstanceSettings) (ins
 	}
 
 	return &CloudLoggingDatasource{
-		client: client,
+		client:      client,
+		passthrough: conf.AuthType == oauthpassthroughAuthentication,
 	}, nil
 }
 
 // CloudLoggingDatasource is an example datasource which can respond to data queries, reports
 // its health and has streaming skills.
 type CloudLoggingDatasource struct {
-	client cloudlogging.API
+	client      cloudlogging.API
+	passthrough bool
 }
 
 // Dispose here tells plugin SDK that plugin wants to clean up resources when a new instance
@@ -234,7 +243,7 @@ func (d *CloudLoggingDatasource) QueryData(ctx context.Context, req *backend.Que
 
 	// loop over queries and execute them individually.
 	for _, q := range req.Queries {
-		res := d.query(ctx, req.PluginContext, q)
+		res := d.query(ctx, req.Headers, req.PluginContext, q)
 
 		// save the response in a hashmap
 		// based on with RefID as identifier
@@ -253,7 +262,7 @@ type queryModel struct {
 	ViewId    string `json:"viewId"`
 }
 
-func (d *CloudLoggingDatasource) query(ctx context.Context, pCtx backend.PluginContext, query backend.DataQuery) backend.DataResponse {
+func (d *CloudLoggingDatasource) query(ctx context.Context, requestHeaders map[string]string, pCtx backend.PluginContext, query backend.DataQuery) backend.DataResponse {
 	response := backend.DataResponse{}
 
 	var q queryModel
@@ -283,6 +292,9 @@ func (d *CloudLoggingDatasource) query(ctx context.Context, pCtx backend.PluginC
 		},
 	}
 
+	if d.passthrough {
+		d.client.SetPassthroughHeaders(ctx, requestHeaders)
+	}
 	logs, err := d.client.ListLogs(ctx, &clientRequest)
 	if err != nil {
 		response.Error = fmt.Errorf("query: %w", err)
@@ -324,7 +336,7 @@ func (d *CloudLoggingDatasource) query(ctx context.Context, pCtx backend.PluginC
 // datasource configuration page which allows users to verify that
 // a datasource is working as expected.
 func (d *CloudLoggingDatasource) CheckHealth(ctx context.Context, req *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
-	// log.DefaultLogger.Info("CheckHealth called")
+	log.DefaultLogger.Warn("CheckHealth called")
 
 	var status = backend.HealthStatusOk
 	settings := req.PluginContext.DataSourceInstanceSettings
@@ -340,6 +352,9 @@ func (d *CloudLoggingDatasource) CheckHealth(ctx context.Context, req *backend.C
 			return nil, fmt.Errorf("failed to get GCE default project: %w", err)
 		}
 		conf.DefaultProject = proj
+	}
+	if d.passthrough {
+		d.client.SetPassthroughHeaders(ctx, req.Headers)
 	}
 	if err := d.client.TestConnection(ctx, conf.DefaultProject); err != nil {
 		return &backend.CheckHealthResult{
