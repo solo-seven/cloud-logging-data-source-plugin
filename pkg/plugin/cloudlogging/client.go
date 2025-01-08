@@ -23,6 +23,7 @@ import (
 	"time"
 
 	logging "cloud.google.com/go/logging/apiv2"
+	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"golang.org/x/oauth2"
 	resourcemanager "google.golang.org/api/cloudresourcemanager/v1"
@@ -56,6 +57,8 @@ type API interface {
 	// Close closes the underlying connection to the GCP API
 	Close() error
 	SetPassthroughHeaders(ctx context.Context, headers map[string]string) error
+	IsInitialized() bool
+	Initialize(ctx context.Context, req *backend.CheckHealthRequest) error
 }
 
 // Client wraps a GCP logging client to fetch logs, a resourcemanager client
@@ -69,33 +72,64 @@ type Client struct {
 // NewClient creates a new Client using jsonCreds for authentication
 func NewClientWithPassthrough(ctx context.Context) (*Client, error) {
 	log.DefaultLogger.Info("Using OAuth Passthrough")
-	// TODO - we have to figure out how to get the token from Grafana here or defer the creation until
-	// client, err := logging.NewClient(ctx, option.WithUserAgent("googlecloud-logging-datasource"))
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// log.DefaultLogger.Info("Logging Client created")
-	// rClient, err := resourcemanager.NewService(ctx, option.WithUserAgent("googlecloud-logging-datasource"))
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// log.DefaultLogger.Info("Resource Client created")
-
-	// configClient, err := logging.NewConfigClient(ctx, option.WithUserAgent("googlecloud-logging-datasource"))
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// log.DefaultLogger.Info("Config Client created")
-	// return &Client{
-	// 	lClient:      client,
-	// 	rClient:      rClient.Projects,
-	// 	configClient: configClient,
-	// }, nil
 	return &Client{
 		lClient:      nil,
 		rClient:      nil,
 		configClient: nil,
 	}, nil
+}
+
+func (c *Client) IsInitialized() bool {
+	return c.lClient != nil && c.rClient != nil && c.configClient != nil
+}
+
+func (c *Client) Initialize(ctx context.Context, req *backend.CheckHealthRequest) error {
+	// Extract OAuth token from headers
+	authHeader := req.GetHTTPHeader(backend.OAuthIdentityTokenHeaderName)
+	if authHeader == "" {
+		return fmt.Errorf("no OAuth token found in headers")
+	}
+
+	// Split "Bearer <token>"
+	token := strings.Fields(authHeader)
+	if len(token) != 2 || token[0] != "Bearer" {
+		return fmt.Errorf("invalid OAuth token format")
+	}
+	accessToken := token[1]
+
+	// Create static token source
+	tokenSource := oauth2.StaticTokenSource(&oauth2.Token{
+		AccessToken: accessToken,
+	})
+
+	// Create logging client with OAuth token
+	loggingClient, err := logging.NewClient(ctx,
+		option.WithTokenSource(tokenSource),
+		option.WithUserAgent("googlecloud-logging-datasource"))
+	if err != nil {
+		return fmt.Errorf("failed to create logging client: %w", err)
+	}
+
+	// Create resource manager client with OAuth token
+	resourceClient, err := resourcemanager.NewService(ctx,
+		option.WithTokenSource(tokenSource),
+		option.WithUserAgent("googlecloud-logging-datasource"))
+	if err != nil {
+		return fmt.Errorf("failed to create resource client: %w", err)
+	}
+
+	// Create config client with OAuth token
+	configClient, err := logging.NewConfigClient(ctx,
+		option.WithTokenSource(tokenSource),
+		option.WithUserAgent("googlecloud-logging-datasource"))
+	if err != nil {
+		return fmt.Errorf("failed to create config client: %w", err)
+	}
+	c.lClient = loggingClient
+	c.rClient = resourceClient.Projects
+	c.configClient = configClient
+
+	return nil
 }
 
 // NewClient creates a new Client using jsonCreds for authentication
