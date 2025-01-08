@@ -96,7 +96,7 @@ func NewCloudLoggingDatasource(settings backend.DataSourceInstanceSettings) (ins
 
 	log.DefaultLogger.Info("oauthPassthrough: " + strconv.FormatBool(conf.OauthPassthrough))
 	if conf.OauthPassthrough {
-		client, client_err = cloudlogging.NewClientWithPassthrough(context.TODO())
+		client, client_err = cloudlogging.NewClientWithPassthrough(context.TODO(), nil)
 	} else if conf.AuthType == jwtAuthentication {
 		// TODO: Add support for extracting token from Grafana to pass on
 		privateKey, ok := settings.DecryptedSecureJSONData[privateKeyKey]
@@ -353,7 +353,16 @@ func (d *CloudLoggingDatasource) CheckHealth(ctx context.Context, req *backend.C
 		}
 		conf.DefaultProject = proj
 	}
+	// Creating for passthrough is deferred until we check the health so we get a request object.
 	if d.passthrough {
+		if !d.client.IsInitialized() {
+			if d.client.Initialize(ctx, req) == nil {
+				return &backend.CheckHealthResult{
+					Status:  backend.HealthStatusError,
+					Message: "failed to initialize client",
+				}, nil
+			}
+		}
 		d.client.SetPassthroughHeaders(ctx, req.Headers)
 	}
 	if err := d.client.TestConnection(ctx, conf.DefaultProject); err != nil {

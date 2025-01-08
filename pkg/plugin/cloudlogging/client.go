@@ -24,7 +24,6 @@ import (
 
 	logging "cloud.google.com/go/logging/apiv2"
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
-	"github.com/grafana/grafana-plugin-sdk-go/backend/httpclient"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"golang.org/x/oauth2"
 	resourcemanager "google.golang.org/api/cloudresourcemanager/v1"
@@ -58,6 +57,8 @@ type API interface {
 	// Close closes the underlying connection to the GCP API
 	Close() error
 	SetPassthroughHeaders(ctx context.Context, headers map[string]string) error
+	IsInitialized() bool
+	Initialize(ctx context.Context, req *backend.CheckHealthRequest) error
 }
 
 // Client wraps a GCP logging client to fetch logs, a resourcemanager client
@@ -71,16 +72,28 @@ type Client struct {
 // NewClientWithPassthrough creates a new Client using OAuth passthrough authentication
 func NewClientWithPassthrough(ctx context.Context, req *backend.QueryDataRequest) (*Client, error) {
 	log.DefaultLogger.Info("Using OAuth Passthrough")
+	return &Client{
+		lClient:      nil,
+		rClient:      nil,
+		configClient: nil,
+	}, nil
+}
+
+func (c *Client) IsInitialized() bool {
+	return c.lClient != nil && c.rClient != nil && c.configClient != nil
+}
+
+func (c *Client) Initialize(ctx context.Context, req *backend.CheckHealthRequest) error {
 	// Extract OAuth token from headers
 	authHeader := req.GetHTTPHeader(backend.OAuthIdentityTokenHeaderName)
 	if authHeader == "" {
-		return nil, fmt.Errorf("no OAuth token found in headers")
+		return fmt.Errorf("no OAuth token found in headers")
 	}
 
 	// Split "Bearer <token>"
 	token := strings.Fields(authHeader)
 	if len(token) != 2 || token[0] != "Bearer" {
-		return nil, fmt.Errorf("invalid OAuth token format")
+		return fmt.Errorf("invalid OAuth token format")
 	}
 	accessToken := token[1]
 
@@ -94,7 +107,7 @@ func NewClientWithPassthrough(ctx context.Context, req *backend.QueryDataRequest
 		option.WithTokenSource(tokenSource),
 		option.WithUserAgent("googlecloud-logging-datasource"))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create logging client: %w", err)
+		return fmt.Errorf("failed to create logging client: %w", err)
 	}
 
 	// Create resource manager client with OAuth token
@@ -102,22 +115,21 @@ func NewClientWithPassthrough(ctx context.Context, req *backend.QueryDataRequest
 		option.WithTokenSource(tokenSource),
 		option.WithUserAgent("googlecloud-logging-datasource"))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create resource client: %w", err)
+		return fmt.Errorf("failed to create resource client: %w", err)
 	}
 
-	// Create config client with OAuth token 
+	// Create config client with OAuth token
 	configClient, err := logging.NewConfigClient(ctx,
 		option.WithTokenSource(tokenSource),
 		option.WithUserAgent("googlecloud-logging-datasource"))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create config client: %w", err)
+		return fmt.Errorf("failed to create config client: %w", err)
 	}
+	c.lClient = loggingClient
+	c.rClient = resourceClient.Projects
+	c.configClient = configClient
 
-	return &Client{
-		lClient:      loggingClient,
-		rClient:      resourceClient.Projects,
-		configClient: configClient,
-	}, nil
+	return nil
 }
 
 // NewClient creates a new Client using jsonCreds for authentication
@@ -239,25 +251,6 @@ func (c *Client) SetPassthroughHeaders(ctx context.Context, headers map[string]s
 	c.lClient, _ = logging.NewClient(ctx, option.WithUserAgent("googlecloud-logging-datasource"), option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})))
 	log.DefaultLogger.Info("Config Client created")
 	return nil
-}
-
-// QueryData handles query requests with OAuth passthrough
-func (c *Client) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
-	// Create HTTP client options with OAuth forwarding enabled
-	opts := &httpclient.Options{
-		ForwardHTTPHeaders: true,
-	}
-
-	// Create HTTP client
-	httpClient, err := httpclient.New(opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
-	}
-
-	// Use httpClient for requests...
-	// Implementation specific to your query needs
-
-	return &backend.QueryDataResponse{}, nil
 }
 
 // Query is the information from a Grafana query needed to query GCP for logs
